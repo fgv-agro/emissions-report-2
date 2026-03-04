@@ -1,0 +1,1001 @@
+---
+title: "Relatório Técnico: Cenários de Estimativas de Emissões de GEE no Brasil com o Modelo MAgPIE"
+author: "Sabrina de Matos Carlos, Fernanda Valente, Cícero Lima, Ângelo Gurgel"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::material:
+    base_format: bookdown::html_document2   
+    cards: false
+    lightbox: true
+    thumbnails: true
+    highlight: "tango"
+    code_folding: hide
+---
+
+```{=html}
+<style>
+body {
+  text-align: justify;
+}
+
+/* pinta a faixa superior do tema material */
+.header-panel,
+.material-header,
+.navbar,
+.navbar-default,
+.navbar-inverse,
+.navbar.navbar-inverse.navbar-fixed-top,
+.site-header {
+  background-color: #053D7F !important;
+  border-color: #053D7F !important;
+}
+
+/* deixa os textos do topo legíveis sobre o azul */
+.material-header h1.title,
+h1.title,
+.author, .date,
+.navbar a,
+.navbar .navbar-brand,
+.navbar .nav > li > a {
+  color: #ffffff !important;
+}
+
+/* insere o logo */
+.fgv-logo-fixed {
+  position: fixed;
+  left: 60px;     
+  bottom: 20px;   
+  width: 280px;   
+  z-index: 9999;
+  opacity: 1;
+  background: none !important;
+  padding: 0 !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+.fgv-logo-fixed img {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: none !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+/* deixa ainda maior em telas grandes */
+@media (min-width: 1400px){
+  .fgv-logo-fixed{ width: 280px; }
+}
+
+/* esconde no mobile pra não atrapalhar */
+@media (max-width: 992px){
+  .fgv-logo-fixed{ display: none; }
+}
+
+/* Faz a caixa das figuras ocupar 100% */
+div.figure {
+  width: 100% !important;
+  margin-left: auto !important;
+  margin-right: auto !important;
+}
+
+/* Remove o "card" de fundo do rmdformats para as figuras */
+.material-doc .section .figure, 
+.material-doc .section .figure img {
+  box-shadow: none !important;   
+  border: none !important;       
+  background: none !important;   
+}
+
+/* Garante que a imagem ocupe toda a largura */
+.figure img {
+  display: block;
+  margin: 0 auto;
+  max-width: 100% !important;
+  height: auto !important;
+}
+</style>
+```
+
+```{=html}
+<div class="fgv-logo-fixed">
+  <img src="img/logo_fgv.png" alt="FGV">
+</div>
+```
+
+```{r preambulo, warning= FALSE, message = FALSE}
+# Opções globais dos chunks
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 12, fig.height = 6, out.width = "100%")
+
+# Pacotes
+library(sf); library(sp); library(dplyr); library(raster)
+library(madrat); library(magclass); library(magpie4); library(luplot); library(gdx2)
+library(terra); library(ggplot2); library(scales); library(geobr); library(rmdformats)
+
+# Paleta padrão para mapas
+pal_magpie_ch4 <- hcl.colors(20, "YlOrBr", rev = TRUE)
+pal_magpie_n2o <- hcl.colors(20, "Reds", rev = TRUE)
+```
+
+```{r dados, warning = FALSE, message = FALSE}
+
+# Mapa de clusters e filtro BRA com lon/lat numéricos
+map_file <- readRDS("clustermap_rev4.121_c200_67420_h12.rds")
+
+BRA <- subset(map_file, country == "BRA")
+coords <- strsplit(BRA$cell, "\\.")
+mat <- do.call(rbind, coords)
+BRA$lon <- as.numeric(gsub("p", ".", mat[,1]))
+BRA$lat <- as.numeric(gsub("p", ".", mat[,2]))
+BRA$iso <- mat[,3]
+
+# Shapes
+bra    <- geobr::read_country(showProgress = FALSE) |> st_transform(4326)
+biomes <- geobr::read_biomes(showProgress = FALSE)  |> st_transform(4326)
+state <- geobr::read_state(showProgress = FALSE) |> st_transform(4326)
+```
+
+```{r helpers, warning=FALSE, message=FALSE}
+# Formata "2010" -> "y2010.y2010"
+fmt_year <- function(y) paste0("y", y, ".y", y)
+
+# Converte magclass -> data.frame com nomes consistentes
+mag_to_df <- function(obj) {
+  df <- as.data.frame(obj, rev = 2)
+  names(df) <- c("lon", "lat", "iso", "year.start", "year.end", "emis_source", "pollutants", "value")
+  df
+}
+
+# GWP (SAR 100y) padronizado
+gwp_sar <- c(co2 = 1, ch4 = 21, n2o = 310)
+
+mt_to_Gg <- function(x) x * 1000
+mt_to_kt <- function(x) x * 1000
+
+# Aplica GWP e converte para Gg CO2e/ano
+apply_gwp <- function(df, gas = "ch4", gwp_table = gwp_sar) {
+  g <- tolower(gas)
+  if (!g %in% names(gwp_table)) stop("Gás não encontrado na tabela de GWP.")
+  df |>
+    mutate(value_co2e = value * gwp_table[[g]])
+}
+
+# Rasteriza um data.frame (lon,lat,value) e retorna grid por ano (lista empilhada)
+gridify_by_year <- function(d, bra_sf) {
+  split(d, d$year.end) |>
+    lapply(function(x) {
+      r  <- terra::rast(x[, c("lon","lat","value")], type = "xyz", crs = "EPSG:4326")
+      r  <- terra::crop(r, terra::vect(bra_sf))
+      r  <- terra::mask(r, terra::vect(bra_sf))
+      gd <- as.data.frame(r, xy = TRUE, na.rm = TRUE)
+      names(gd) <- c("lon","lat","value")
+      gd$year.end <- unique(x$year.end)
+      gd
+    }) |>
+    dplyr::bind_rows()
+}
+
+# Soma total por fonte em um recorte (country, yearS) e retorna top-k nomes (dim k do magclass)
+top_k_sources <- function(dis_obj, country = "BRA", yearS, k = 2, pattern = NULL) {
+  ks <- magclass::getItems(dis_obj, dim = 3)
+  if (!is.null(pattern)) ks <- grep(pattern, ks, value = TRUE)
+  totals <- sapply(ks, function(p) sum(as.numeric(dis_obj[country, yearS, p]), na.rm = TRUE))
+  totals <- totals[totals > 0]
+  names(sort(totals, decreasing = TRUE))[seq_len(min(k, length(totals)))]
+}
+
+# Extrai uma fonte específica e devolve df com lon/lat/iso/anos/value (Mt gás), mais 'source'
+extract_one_source <- function(dis_obj, country, yearS, src) {
+  obj <- dis_obj[country, yearS, src]
+  d   <- mag_to_df(obj)
+  d$lon   <- as.numeric(gsub("p", ".", d$lon))
+  d$lat   <- as.numeric(gsub("p", ".", d$lat))
+  d$source <- src
+  d
+}
+
+# Figura de mapa facetado por ano
+plot_faceted_map <- function(gdf, bra_sf, biomes_sf, title, fill_lab = "kt CO2e", pal) {
+  ggplot() +
+    geom_raster(data = gdf, aes(lon, lat, fill = value)) +
+    geom_sf(data = biomes_sf, fill = NA, color = "grey35", linewidth = 0.25) +
+    geom_sf(data = bra_sf,    fill = NA, color = "grey15", linewidth = 0.4) +
+    coord_sf(xlim = c(-74, -34), ylim = c(-34, 6), expand = FALSE) +
+    facet_wrap(~ year.end) +
+    scale_fill_gradientn(colors = pal, name = fill_lab) +
+    labs(title = title, caption = "Source: MAgPIE") +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "right",
+      panel.grid      = element_blank(),
+      plot.title      = element_text(face = "bold", size = 26, hjust = 0),
+      axis.text.x     = element_text(angle = 45, hjust = 1)
+    )
+}
+
+# Mapa facetado por fonte (num único ano)
+plot_by_source <- function(gdf, bra_sf, biomes_sf, title, fill_lab = "kt CO2e", pal, ncol = 2) {
+  ggplot() +
+    geom_raster(data = gdf, aes(lon, lat, fill = value)) +
+    geom_sf(data = biomes_sf, fill = NA, color = "grey35", linewidth = 0.25) +
+    geom_sf(data = bra_sf,    fill = NA, color = "grey15", linewidth = 0.4) +
+    coord_sf(xlim = c(-74, -34), ylim = c(-34, 6), expand = FALSE) +
+    facet_wrap(~ source, ncol = ncol) +
+    scale_fill_gradientn(colors = pal, name = fill_lab) +
+    labs(title = title, caption = "Source: MAgPIE") +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "right",
+      panel.grid      = element_blank(),
+      plot.title      = element_text(face = "bold", size = 22)
+    )
+}
+```
+
+# Introdução
+
+# Cenários no MAgPIE
+
+O MAgPIE permite construir cenários altamente customizáveis combinando condições socioeconômicas, políticas de carbono, bioenergia, manejo florestal e clima. Cada módulo é independente, mas pode ser integrado, permitindo simular desde políticas locais até impactos globais sob diferentes trajetórias de Shared Socioeconomic Pathways (SSP) e Representative Concentration Pathways (RCP).
+
+Um cenário é definido por uma configuração específica de parâmetros e entradas, que afetam por exemplo:
+
+- Políticas climáticas
+- Uso da terra
+- Demanda por alimentos e biomassa
+- Impactos climáticos
+- Modelos acoplados (e.g., REMIND-MAgPIE)
+
+Assim, um cenário pode ser composto por:
+
+```{=html}
+<div class="scenario-figure">
+  <div class="scenario-bar">
+    SSP (socioeconomia) + Política climáticas/ambientais + Tecnologia
+  </div>
+
+  <svg class="scenario-arrows" viewBox="0 0 1000 160">
+    <!-- esquerda (curvada) -->
+    <path d="M 100 10 C 60 45, 50 75, 50 125" fill="none" stroke="#111" stroke-width="3"/>
+    <path d="M 50 125 L 40 110 L 60 110 Z" fill="#111"/>
+    <!-- meio (reta) -->
+    <path d="M 500 10 L 500 125" fill="none" stroke="#111" stroke-width="3"/>
+    <path d="M 500 125 L 490 110 L 510 110 Z" fill="#111"/>
+    <!-- direita (curvada) -->
+    <path d="M 900 10 C 940 45, 950 75, 950 125" fill="none" stroke="#111" stroke-width="3"/>
+    <path d="M 950 125 L 940 110 L 960 110 Z" fill="#111"/>
+  </svg>
+
+  <div class="scenario-labels">
+    <div class="lab">Driver exógeno</div>
+    <div class="lab">Restrições ou preços</div>
+    <div class="lab">Possibilidade<br>de resposta do<br>sistema</div>
+  </div>
+</div>
+
+<style>
+.scenario-figure{max-width:1000px;margin:12px auto 10px auto;font-family:Arial,Helvetica,sans-serif;}
+.scenario-bar{
+  background:#0b4f87;
+  color:#fff;
+  font-weight:700;
+  font-size:22px;
+  padding:12px 16px;
+  white-space: nowrap;
+  text-align:center; 
+}
+.scenario-arrows{width:100%;height:95px;display:block;margin-top:6px;}
+.scenario-labels{display:flex;justify-content:space-between;gap:16px;font-size:26px;margin-top:-4px;}
+.scenario-labels .lab{width:33.33%;text-align:center;line-height:1.1;}
+</style>
+```
+
+## Tipos de cenários
+
+A estrutura de cenários do modelo pode ser organizada em seis grandes grupos, que podem ser combinados entre si para gerar diferentes trajetórias de evolução socioeconômica, climática, tecnológica e de políticas públicas.
+
+### (a) Cenários socioeconômicos (SSPs)
+Baseados nos **SSPs (Shared Socioeconomic Pathways)** — *SSP1, SSP2, SSP3, SSP4, SSP5*.  
+Esses cenários definem premissas como:
+
+- população;
+- crescimento econômico;
+- padrões de dieta/consumo;
+- demanda por alimentos e bioenergia;
+- uso da terra.
+
+### (b) Cenários climáticos
+São definidos pelos **RCPs (Representative Concentration Pathways)**. Há ainda opções que controlam a presença (ou ausência) de mudança climática:
+
+- `cc`: **considera mudanças climáticas** nas trajetórias;
+- `nocc`: **ignora mudanças climáticas**;
+- `nocc_hist`: mantém **sem mudanças climáticas após um ano definido** (congelamento do clima a partir do ano de referência).
+
+### (c) Políticas de emissão (GHG pricing & REDD+)
+Incluem cenários de políticas de gases de efeito estufa (GEE), como:
+
+- `none`: sem precificação;
+- combinações denominadas como `redd_nosoil`, `reddnatveg_nosoil`, `all_nosoil`, `sdp_all`, entre outras. 
+
+Em que `redd_nosoil` refere-se às emissões de CO2 acima do solo provenientes da mudança no uso da terra (LUC) em florestas, todas as emissões de CH4 e N2O; `reddnatveg_nosoil` diz respeito às emissões de CO2 acima do solo provenientes da mudança no uso da terra (LUC) em florestas e vegetação natural, todas as emissões de CH4 e N2O; `all_nosoil` considera as emissões de CO2 acima do solo provenientes da mudança no uso da terra (LUC) para todos os usos da terra (LUs); todas as emissões de CH4 e N2O; e, por fim, `sdp_all` inclui todos os cenários individuais de *Sustainable Development Pathway* (SDP) combinados, ou seja, os resultados de cada trajetória de desenvolvimento sustentável são reunidos em um único resultado agregado.
+
+Esses módulos permitem diferenciar a política por país/região, de modo que diferentes países possam adotar políticas distintas (por exemplo, via `policy_countries56` vs `noselect`).
+
+### (d) Cenários de bioenergia
+Incluem:
+
+- **1ª geração**: `phaseout2020`, `const2020`, `const2030`;
+- **2ª geração**: cenários baseados em modelos acoplados (**REMIND–MAgPIE**), com SSPs e `PkBudg`;
+- configuração de **nível regional ou global** (`c60_bioedem_level`).
+
+
+### (e) Cenários de manejo florestal e madeira
+Focados em políticas e regras de manejo, incluindo:
+
+- controle de demanda por madeira (`s73_timber_demand_switch`);
+- diferentes políticas de plantio e colheita;
+- possibilidade de modelar tanto **plantações dinâmicas** quanto **fixas**.
+
+### (f) Cenários regionais ou parciais
+Cenários em que políticas são aplicadas apenas a **subconjuntos de países/regiões**, permitindo análises específicas (por exemplo, recortes geográficos ou blocos econômicos).
+
+> **Observação:** a combinação desses módulos permite gerar milhares de configurações possíveis, desde cenários conservadores até cenários ambiciosos de mitigação.
+
+## Implementação de cenários no MAgPIE
+
+O MAgPIE permite o uso de cenários já existentes (plug-and-play) com diferentes níveis de complexidade e flexibilidade. Em termos práticos, isso pode ser feito através de: 
+
+- **Modificação direta de chaves/parâmetros via `default.cfg` ou *start script* **: A forma mais simples de construir cenários consiste em alterar chaves/parâmetros diretamente no arquivo de configuração padrão (`default.cfg`) ou no *start script*, sendo ideal para análises comparativas simples;
+
+- **Cenários fatoriais**: Para análises sistemáticas envolvendo múltiplas combinações de parâmetros, o MAgPIE permite a construção de cenários fatoriais, isto é, cenários que exploram tanto os efeitos isolados quanto os efeitos combinados de diferentes hipóteses. Essa abordagem é particularmente útil para análises de sensibilidade e para a avaliação estruturada de interações entre variáveis.
+
+- **Execução em lotes com cenários versionados**: A execução em lote de cenários versionados complementa a abordagem fatorial ao organizar de forma estruturada as diferentes configurações testadas. O uso de versionamento é central nessa etapa, pois garante a **rastreabilidade** das configurações utilizadas, facilita a replicação dos experimentos e permite documentar explicitamente as combinações de parâmetros avaliadas.
+
+- **Mudanças consistentes via *scenario configuration table* **: Para análises ainda mais complexas, os usuários frequentemente precisam testar cenários internamente consistentes que incorporam, por exemplo, diferentes SSPs, RCPs, mudanças na dieta ou níveis de mudança climática. Essas análises envolvem o uso da *scenario configuration table* que, diferentemente de ajustes pontuais de parâmetros, permitem mudanças que são metodologicamente mais consistentes, pois garantem coerência interna entre módulos. No entanto, são também **mais complexas e menos flexíveis**, exigindo maior cuidado na documentação e validação.
+
+# Modificação direta de chaves/parâmetros
+
+Para avaliar a sensibilidade dos resultados do MAgPIE a uma única alteração de chave/parâmetro, serão analisados exemplos de aplicação em três contextos diferentes: (i) cenários climáticos sobre produtividade agrícola; (ii) cenários de preços de carbono (REMIND-MAgPIE); (iii) cenários de políticas de preços de carbono no contexto de REDD+. Em cada experimento, partimos do arquivo de configuração padrão do modelo (`config/default.cfg`) e alteramos apenas uma chave/parâmetro do conjunto, mantendo todas as demais opções idênticas entre as rodadas. 
+
+O procedimento é implementado em R seguindo três passos:
+
+1. Carregar funções e configuração padrão: as funções de inicialização do MAgPIE são carregadas com `source("scripts/start_functions.R")` e, antes de cada rodada, o arquivo `config/default.cfg` é recarregado para “zerar” modificações anteriores.
+2. Modificar a chave de interesse: alteramos diretamente a entrada desejada em `cfg$gms$<parametro>`.
+3. Executar a rodada e registrar título: definimos cfg$title com um identificador único (versão + nome do exercício) e chamamos `start_run(cfg, codeCheck = FALSE)`.
+
+A estrutura abaixo é usada como template para qualquer chave/parâmetro, mudando apenas o nome e os valores testados.
+
+```{r, warning = FALSE, message = FALSE, eval = FALSE}
+setwd("~/Documents/magpie")
+
+source("scripts/start_functions.R")
+version <- "vX"
+
+# ---- Rodada A (baseline do exercício) ----
+source("config/default.cfg")  # reseta cfg
+
+cfg$title <- paste(version, "EXERCICIO_A", sep = "_")
+cfg$gms$NOME_DA_CHAVE <- "VALOR_A"
+
+start_run(cfg, codeCheck = FALSE)
+
+# ---- Rodada B (tratamento do exercício) ----
+source("config/default.cfg")  # reseta cfg de novo
+
+cfg$title <- paste(version, "EXERCICIO_B", sep = "_")
+cfg$gms$NOME_DA_CHAVE <- "VALOR_B"
+
+start_run(cfg, codeCheck = FALSE)
+```
+
+## Exemplo de aplicação: cenários climáticos sobre produtividade agrícola
+
+No cenário `cc`, as trajetórias de produtividade agrícola seguem as projeções do modelo LPJmL, enquanto no cenário `nocc` os yields são fixados nos níveis de 1995, eliminando variações induzidas pela mudança climática. Como alternativa intermediária, o cenário `nocc_hist` mantém a evolução histórica das produtividades até um ano de referência pré-definido e, a partir desse ponto, congela os yields, removendo impactos climáticos adicionais no horizonte futuro.
+
+Neste exercício, avaliamos o efeito da escolha entre os cenários `cc` e `nocc` sobre as emissões de metano ($CH_4$) e óxido nitroso ($N_2O$) estimadas pelo MAgPIE, buscando isolar a contribuição dos impactos climáticos sobre a produtividade agrícola na dinâmica das emissões.
+
+As Figuras 1 e 2 ilustram este exercício para o metano. Por sua vez, as Figuras 3 e 4 evidenciam o mesmo procedimento aplicado à análise das emissões de óxido nitroso.
+
+```{r, warning = FALSE, message = FALSE, eval=FALSE}
+source("scripts/start_functions.R")
+version <- "v1"
+
+# --- cc yield scenario ---
+source("config/default.cfg")
+cfg$title <- paste(version, "cc_yield_scenario", sep = "_")
+cfg$gms$c14_yields_scenario <- "cc"
+start_run(cfg, codeCheck = FALSE)
+
+# --- nocc yield scenario ---
+source("config/default.cfg")
+cfg$title <- paste(version, "nocc_yield_scenario", sep = "_")
+cfg$gms$c14_yields_scenario <- "nocc"
+start_run(cfg, codeCheck = FALSE)
+```
+
+```{r, totais-ch4-sirene-linhas, warning=FALSE, message=FALSE, fig.cap="Totais de emissões de $CH_4$ no Brasil (kt $CO_2e$, GWP100-AR5): barras com valores do Quarto Inventário (SIRENE) para 2010, 2015 e 2020, e trajetórias do MAgPIE para yields CC e NOCC até 2100.",fig.align='center'}
+
+# Pastas dos cenários
+scen_nocc <- "v1_nocc_yield_scenario_2026-02-07_17.15.01"
+scen_cc   <- "v1_cc_yield_scenario_2026-02-09_10.59.56"
+
+# Pastagem como weight
+x <- read.magpie(file.path(scen_nocc, "cell.land_0.5.mz"))[,, "past"]
+x[is.na(x)] <- 0
+
+gas    <- "ch4"
+years  <- c(2010, 2015, 2020, 2025, 2030, 2035, 2040, 2045, 2050, 2100)
+yearS  <- fmt_year(years)
+
+# Função local: extrai total por célula/ano (kt CO2e) para um cenário
+get_cell_total <- function(scen_dir) {
+
+  # 1) Emissões por gás no nível regional (reg), em Mt gás
+  emis_gas <- Emissions(
+    gdx        = file.path(scen_dir, "fulldata.gdx"),
+    type       = gas,
+    level      = "reg",
+    unit       = "GWP100AR5",
+    cumulative = FALSE
+  )
+  emis_gas <- emis_gas[, paste0("y", years)]
+
+  # 2) Agrega de região -> célula usando mapa/weight
+  dis_emis_gas <- madrat::toolAggregate(emis_gas, map_file, x, from = "region", to = "cell")
+
+  # 3) Para todos os 'pollutants' do gás, extrai BRA x anos e empilha
+  ks <- magclass::getItems(dis_emis_gas, dim = 3)
+  ks <- grep(paste0("\\.", gas, "$"), ks, value = TRUE)
+
+  df_gas_total <- dplyr::bind_rows(lapply(ks, function(k) mag_to_df(dis_emis_gas["BRA", yearS, k])))
+
+  # 4) Soma sobre as fontes para dar o total por célula/ano (Mt CO2e)
+  df_gas_sum <- aggregate(value ~ lon + lat + iso + year.start + year.end,
+                          data = df_gas_total, FUN = sum)
+
+  # 5) Junta com grades BRA e converte Mt -> kt
+  BRA |>
+    left_join(df_gas_sum, by = c("lon","lat","iso")) |>
+    mutate(value = dplyr::coalesce(value, 0),
+           kt_co2eq = mt_to_kt(value)) |>
+    dplyr::select(lon, lat, iso, year.end, kt_co2eq)
+}
+
+# Extrai CC e NOCC
+df_cc   <- get_cell_total(scen_cc)   |> dplyr::rename(kt_cc   = kt_co2eq)
+df_nocc <- get_cell_total(scen_nocc) |> dplyr::rename(kt_nocc = kt_co2eq)
+
+# ---- Totais MAgPIE (CC / NOCC) por ano ----
+tot_cc <- df_cc |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_cc, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "MAgPIE - Yields CC")
+
+tot_nocc <- df_nocc |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_nocc, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "MAgPIE - Yields NOCC")
+
+magpie_lines <- dplyr::bind_rows(tot_cc, tot_nocc) |>
+  dplyr::filter(year %in% years)
+
+# ---- SIRENE (barras; só 2010/2015/2020) ----
+sirene_br <- tibble::tibble(
+  year = c(2010, 2015, 2020),
+  value_kt = c(432565, 434079, 449829)
+)
+
+# ---- Plot: barras (SIRENE) + linhas (MAgPIE) ----
+ggplot() +
+  geom_col(data = sirene_br,
+           aes(x = factor(year), y = value_kt),
+           width = 0.7, alpha = 0.6) +
+  geom_text(data = sirene_br,
+            aes(x = factor(year), y = value_kt, label = scales::comma(value_kt)),
+            vjust = -0.2, size = 3.3) +
+  geom_line(data = magpie_lines,
+            aes(x = factor(year), y = value_kt, group = scenario, linetype = scenario),
+            linewidth = 1) +
+  geom_point(data = magpie_lines,
+             aes(x = factor(year), y = value_kt, shape = scenario),
+             size = 2.4) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Figura 1. CH4 — Brasil (kt CO2e, GWP100-AR5): SIRENE (barras) e MAgPIE (linhas)",
+    x = NULL, y = "kt CO2e",
+    linetype = NULL, shape = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+```{r, warning = FALSE, message = FALSE, fig.cap="Diferença espacial de $CH_4$ entre cenários de yields (CC − NOCC), em kt $CO_2e$ (GWP100AR5) — 2010–2100.", fig.align='center'}
+
+# Diferença (CC - NOCC)
+df_diff <- df_cc |>
+  left_join(df_nocc, by = c("lon","lat","iso","year.end")) |>
+  mutate(value = kt_cc - kt_nocc) |>
+  dplyr::select(lon, lat, year.end, value) |>
+  filter(is.finite(lon), is.finite(lat), is.finite(value))
+
+# Rasteriza por ano e plota
+g_diff <- gridify_by_year(df_diff, bra_sf = bra)
+p_diff <- plot_faceted_map(g_diff, bra, biomes,
+                           title = "Figura 2. CH4, (yields_cc − yields_nocc), kt CO2e",
+                           fill_lab = "Δ kt CO2e",
+                           pal = pal_magpie_ch4)
+p_diff
+```
+
+```{r, totais-n2o-sirene-linhas, warning=FALSE, message=FALSE, fig.cap="Totais de emissões de $N_2O$ no Brasil (kt $CO_2e$, GWP100-AR5): barras com valores do Quarto Inventário (SIRENE) para 2010, 2015 e 2020, e trajetórias do MAgPIE para yields CC e NOCC até 2100.",fig.align='center'}
+
+# Pastas dos cenários
+scen_nocc <- "v1_nocc_yield_scenario_2026-02-07_17.15.01"
+scen_cc   <- "v1_cc_yield_scenario_2026-02-09_10.59.56"
+
+# Crop como weight
+x <- read.magpie(file.path(scen_nocc, "cell.land_0.5.mz"))[,, "crop"]
+x[is.na(x)] <- 0
+
+gas    <- "n2o"
+years  <- c(2010, 2015, 2020, 2025, 2030, 2035, 2040, 2045, 2050, 2100)
+yearS  <- fmt_year(years)
+
+# Função local: extrai total por célula/ano (kt CO2e) para um cenário
+get_cell_total <- function(scen_dir) {
+
+  # 1) Emissões por gás no nível regional (reg), em Mt gás
+  emis_gas <- Emissions(
+    gdx        = file.path(scen_dir, "fulldata.gdx"),
+    type       = gas,
+    level      = "reg",
+    unit       = "GWP100AR5",
+    cumulative = FALSE
+  )
+  emis_gas <- emis_gas[, paste0("y", years)]
+
+  # 2) Agrega de região -> célula usando mapa/weight
+  dis_emis_gas <- madrat::toolAggregate(emis_gas, map_file, x, from = "region", to = "cell")
+
+  # 3) Para todos os 'pollutants' do gás, extrai BRA x anos e empilha
+  ks <- magclass::getItems(dis_emis_gas, dim = 3)
+  ks <- grep(paste0("\\.", gas, "$"), ks, value = TRUE)
+
+  df_gas_total <- dplyr::bind_rows(lapply(ks, function(k) mag_to_df(dis_emis_gas["BRA", yearS, k])))
+
+  # 4) Soma sobre as fontes para dar o total por célula/ano (Mt CO2e)
+  df_gas_sum <- aggregate(value ~ lon + lat + iso + year.start + year.end,
+                          data = df_gas_total, FUN = sum)
+
+  # 5) Junta com grades BRA e converte Mt -> kt
+  BRA |>
+    left_join(df_gas_sum, by = c("lon","lat","iso")) |>
+    mutate(value = dplyr::coalesce(value, 0),
+           kt_co2eq = mt_to_kt(value)) |>
+    dplyr::select(lon, lat, iso, year.end, kt_co2eq)
+}
+
+# Extrai CC e NOCC
+df_cc   <- get_cell_total(scen_cc)   |> dplyr::rename(kt_cc   = kt_co2eq)
+df_nocc <- get_cell_total(scen_nocc) |> dplyr::rename(kt_nocc = kt_co2eq)
+
+# ---- Totais MAgPIE (CC / NOCC) por ano ----
+tot_cc <- df_cc |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_cc, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "MAgPIE - Yields CC")
+
+tot_nocc <- df_nocc |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_nocc, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "MAgPIE - Yields NOCC")
+
+magpie_lines <- dplyr::bind_rows(tot_cc, tot_nocc) |>
+  dplyr::filter(year %in% years)
+
+# ---- SIRENE (barras; só 2010/2015/2020) ----
+sirene_br <- tibble::tibble(
+  year = c(2010, 2015, 2020),
+  value_kt = c(130140, 140231, 156306)
+)
+
+# ---- Plot: barras (SIRENE) + linhas (MAgPIE) ----
+ggplot() +
+  geom_col(data = sirene_br,
+           aes(x = factor(year), y = value_kt),
+           width = 0.7, alpha = 0.6) +
+  geom_text(data = sirene_br,
+            aes(x = factor(year), y = value_kt, label = scales::comma(value_kt)),
+            vjust = -0.2, size = 3.3) +
+  geom_line(data = magpie_lines,
+            aes(x = factor(year), y = value_kt, group = scenario, linetype = scenario),
+            linewidth = 1) +
+  geom_point(data = magpie_lines,
+             aes(x = factor(year), y = value_kt, shape = scenario),
+             size = 2.4) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Figura 3. N2O — Brasil (kt CO2e, GWP100-AR5): SIRENE (barras) e MAgPIE (linhas)",
+    x = NULL, y = "kt CO2e",
+    linetype = NULL, shape = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+As trajetórias de emissões de óxido nitroso apresentadas na Figura 3 diferem daquelas reportadas no primeiro relatório técnico. Essa divergência é atribuída às atualizações metodológicas recentes implementadas no modelo pelo *Potsdam Institute for Climate Impact Research* (PIK).
+
+
+```{r, warning = FALSE, message = FALSE, fig.cap="Diferença espacial de $N_2O$ entre cenários de yields (CC − NOCC), em kt $CO_2e$ (GWP100AR5) — 2010–2100.", fig.align='center'}
+
+# Diferença (CC - NOCC)
+df_diff <- df_cc |>
+  left_join(df_nocc, by = c("lon","lat","iso","year.end")) |>
+  mutate(value = kt_cc - kt_nocc) |>
+  dplyr::select(lon, lat, year.end, value) |>
+  filter(is.finite(lon), is.finite(lat), is.finite(value))
+
+# Rasteriza por ano e plota
+g_diff <- gridify_by_year(df_diff, bra_sf = bra)
+p_diff <- plot_faceted_map(g_diff, bra, biomes,
+                           title = "Figura 4. N20, (yields_cc − yields_nocc), kt CO2e",
+                           fill_lab = "Δ kt CO2e",
+                           pal = pal_magpie_n2o)
+p_diff
+```
+
+## Exemplo de aplicação: política de gases de efeito estufa 
+
+As simulações foram realizadas utilizando o modelo MAgPIE, incorporando o módulo `56_ghg_policy`, responsável por internalizar custos associados às emissões de gases de efeito estufa (GEE). Este módulo conecta as emissões geradas nos diferentes setores do modelo a custos monetários, que passam a integrar a função objetivo de minimização de custos do sistema.
+
+Tecnicamente, o módulo opera multiplicando cada tonelada de emissão por um preço exógeno, definido na variável associada à chave `gms$c56_pollutant_prices`. O custo total das emissões é então incorporado à função objetivo do modelo. Dessa forma, emissões deixam de ser externalidades e passam a influenciar diretamente as decisões ótimas de uso da terra, intensificação produtiva e estrutura do sistema agropecuário.
+
+O módulo 56 interage com os estoques de carbono por meio da interface `vm_carbon_stock`, que agrega informações provenientes dos módulos de uso da terra: `30_crop`, `31_past`, `32_forestry`, `34_urban` e `35_natveg`. Importante destacar que o modelo diferencia emissões pontuais (como $CO_2$ oriundo de desmatamento), que ocorrem apenas no momento da conversão do uso da terra, e emissões recorrentes (como $CH_4$ e $N_2O$ da produção agropecuária), que ocorrem a cada *timestep* do horizonte temporal.
+
+### Cenários
+
+Foram considerados **três cenários distintos**, todos ambientados sob a trajetória socioeconômica SSP2 (Shared Socioeconomic Pathway 2 - *Middle of the Road*), correspondente a um cenário intermediário de crescimento populacional, demanda alimentar e desenvolvimento tecnológico.
+
+* **Cenário de Referência sem Precificação de GEE**: As chaves `gms$c56_pollutant_prices` e `gms$c56_emis_policy` encontram-se desativadas. Nesse caso, não há precificação de emissões nem escopo institucional para aplicação de preços. Consequentemente, as emissões de GEE não entram na função objetivo do modelo. As decisões econômicas são orientadas exclusivamente pelos custos de produção, restrições biofísicas, produtividade, demanda exógena e comércio internacional. Emissões de $CH_4$, $N_2O$ e $CO_2$ são geradas como subproduto das atividades produtivas, mas não geram penalidade econômica. Este cenário representa um contrafactual de ausência de política climática explícita, servindo como baseline para comparação.
+
+* **Cenário de Precificação sob Políticas Vigentes (*NPi*)**: No cenário correspondente a `R34M410-SSP2-NPi2025`, as chaves `gms$c56_pollutant_prices` e `gms$c56_emis_policy` encontram-se ativadas. A trajetória de preços de emissão segue a configuração do cenário NPi2025 (*National Policies implemented until 2025*), refletindo a continuidade das políticas climáticas nacionais já implementadas até o ano de referência, sem introduzir metas adicionais de alta ambição ou restrições globais de orçamento de carbono. A chave `gms$c56_emis_policy`, responsável por definir o escopo da política de precificação, está configurada para a opção `reddnatveg_nosoil`. Essa configuração implica que a política incide especificamente sobre emissões associadas à conversão de vegetação natural (REDD – Reducing Emissions from Deforestation and Forest Degradation), penalizando economicamente a perda de estoques de carbono da vegetação natural. O sufixo `nosoil` indica que a política não considera variações nos estoques de carbono do solo, restringindo a precificação apenas ao carbono da biomassa viva (acima e abaixo do solo).
+
+* **Cenário de Mitigação Moderada com Orçamento de Carbono (*PkBudg1000*)**: Corresponde à opção `R34M410-SSP2-PkBudg1000` ativa em `gms$c56_pollutant_prices`, porém sob uma trajetória consistente com um orçamento cumulativo de carbono de aproximadamente 1000 GtCO2. Neste caso, os preços de emissão são mais elevados e/ou crescentes ao longo do tempo, refletindo maior restrição climática. A internalização dos custos torna-se estrutural, elevando o custo marginal das emissões. Emissões recorrentes, como $CH_4$ e $N_2O$, passam a gerar custos acumulativos ao longo de todo o horizonte temporal, enquanto emissões pontuais associadas à conversão de vegetação natural são penalizadas no momento da ocorrência. O modelo responde com mudanças estruturais, incluindo intensificação mais acentuada, redução do rebanho, menor conversão de vegetação natural e possível realocação espacial da produção via comércio internacional. Este cenário representa uma trajetória de mitigação moderada, compatível com metas climáticas mais ambiciosas do que as políticas atualmente implementadas. Nesse cenário, a opção `reddnatveg_nosoil` em `gms$c56_emis_policy` também está ativa.
+
+A seguir, são apresentados os resultados dos cenários simulados, com foco na avaliação dos impactos sobre as emissões de metano $(CH_₄)$, Figuras 5 e 6, e óxido nitroso $(N_2O)$, Figuras 7 e 8.
+
+As trajetórias de emissões de metano $(CH_4)$ no cenário de referência sem precificação e no cenário com políticas nacionais implementadas até 2025 são bastante semelhantes ao longo do horizonte temporal analisado. Essa proximidade decorre do fato de que, embora exista uma política de precificação de emissões de GEE, a trajetória de preços de emissão associada às políticas atualmente implementadas é relativamente baixa e com escopo limitado (via `gms$c56_emis_policy = reddnatveg_nosoil`), incidindo principalmente sobre a conversão de vegetação natural e não impondo restrição estrutural significativa às emissões recorrentes de $CH_4$ da pecuária. Como consequência, a internalização dos custos de emissões é marginal e insuficiente para alterar de forma substantiva as decisões ótimas de produção e o tamanho do rebanho, resultando em dinâmica semelhante à observada no cenário sem política explícita. 
+
+Em contraste, o cenário de mitigação moderada (`R34M410-SSP2-PkBudg1000`) apresenta redução mais pronunciada das emissões de metano, refletindo preços de carbono mais elevados e consistentes com um orçamento climático mais restritivo, o que induz ajustes estruturais no sistema agropecuário, como intensificação produtiva e contenção da expansão de áreas. Esses resultados sugerem que as políticas atualmente vigentes, especialmente aquelas focadas na redução do desmatamento de vegetação natural, ainda não são suficientemente robustas para promover reduções expressivas nas emissões de metano, ao mesmo tempo em que indicam a necessidade de aperfeiçoamentos na calibração do modelo para melhor capturar as especificidades da dinâmica das emissões brasileiras.
+
+```{r, warning = FALSE, message = FALSE}
+# Pastas dos cenários
+scen_npi_ch4 <- "default"
+scen_none_ch4 <- "v2_None_2026-02-10_01.42.20"
+scen_pkbudg1000_ch4   <- "v2_reddnatveg_nosoil_2026-02-10_02"
+
+# Pastagem como weight
+x <- read.magpie(file.path(scen_pkbudg1000_ch4, "cell.land_0.5.mz"))[,, "past"]
+x[is.na(x)] <- 0
+
+gas    <- "ch4"
+years  <- c(2010, 2015, 2020, 2025, 2030, 2035, 2040, 2045, 2050, 2100)
+yearS  <- fmt_year(years)
+
+# Função local: extrai total por célula/ano (kt CO2e) para um cenário
+get_cell_total <- function(scen_dir) {
+
+  # 1) Emissões por gás no nível regional (reg), em Mt gás
+  emis_gas <- Emissions(
+    gdx        = file.path(scen_dir, "fulldata.gdx"),
+    type       = gas,
+    level      = "reg",
+    unit       = "GWP100AR5",
+    cumulative = FALSE
+  )
+  emis_gas <- emis_gas[, paste0("y", years)]
+
+  # 2) Agrega de região -> célula usando mapa/weight
+  dis_emis_gas <- madrat::toolAggregate(emis_gas, map_file, x, from = "region", to = "cell")
+
+  # 3) Para todos os 'pollutants' do gás, extrai BRA x anos e empilha
+  ks <- magclass::getItems(dis_emis_gas, dim = 3)
+  ks <- grep(paste0("\\.", gas, "$"), ks, value = TRUE)
+
+  df_gas_total <- dplyr::bind_rows(lapply(ks, function(k) mag_to_df(dis_emis_gas["BRA", yearS, k])))
+
+  # 4) Soma sobre as fontes para dar o total por célula/ano (Mt CO2e)
+  df_gas_sum <- aggregate(value ~ lon + lat + iso + year.start + year.end,
+                          data = df_gas_total, FUN = sum)
+
+  # 5) Junta com grades BRA e converte Mt -> kt
+  BRA |>
+    left_join(df_gas_sum, by = c("lon","lat","iso")) |>
+    mutate(value = dplyr::coalesce(value, 0),
+           kt_co2eq = mt_to_kt(value)) |>
+    dplyr::select(lon, lat, iso, year.end, kt_co2eq)
+}
+
+# Extrai none, npi e pkbudg1000
+df_none_ch4   <- get_cell_total(scen_none_ch4)   |> dplyr::rename(kt_none_ch4   = kt_co2eq)
+df_npi_ch4    <- get_cell_total(scen_npi_ch4)    |> dplyr::rename(kt_npi_ch4   = kt_co2eq)
+df_pkbudg1000_ch4 <- get_cell_total(scen_pkbudg1000_ch4) |> dplyr::rename(kt_pkbudg1000_ch4 = kt_co2eq)
+
+# ---- Totais MAgPIE (none / npi / pkbudg1000) por ano ----
+tot_none_ch4 <- df_none_ch4 |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_none_ch4, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "Cenário sem precificação")
+
+tot_npi_ch4 <- df_npi_ch4 |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_npi_ch4, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "Cenário com precificação de emissões e políticas atuais")
+
+tot_pkbudg1000_ch4 <- df_pkbudg1000_ch4 |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_pkbudg1000_ch4, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "Cenário com precificação de emissões e política de mitigação moderada")
+
+magpie_lines <- dplyr::bind_rows(tot_none_ch4, tot_npi_ch4, tot_pkbudg1000_ch4) |>
+  dplyr::filter(year %in% years) |>
+  dplyr::mutate(
+    scenario = factor(
+      scenario, levels = c("Cenário sem precificação",
+                           "Cenário com precificação de emissões e políticas atuais",
+                           "Cenário com precificação de emissões e política de mitigação moderada")))
+
+# ---- SIRENE (barras; só 2010/2015/2020) ----
+sirene_br_ch4 <- tibble::tibble(
+  year = c(2010, 2015, 2020),
+  value_kt = c(432565, 434079, 449829)
+)
+
+# ---- Plot: barras (SIRENE) + linhas (MAgPIE) ----
+ggplot() +
+  geom_col(data = sirene_br_ch4,
+           aes(x = factor(year), y = value_kt),
+           width = 0.7, alpha = 0.6) +
+  geom_text(data = sirene_br_ch4,
+            aes(x = factor(year), y = value_kt, label = scales::comma(value_kt)),
+            vjust = -0.2, size = 3.3) +
+  geom_line(data = magpie_lines,
+            aes(x = factor(year), y = value_kt, group = scenario, linetype = scenario, color = scenario),
+            linewidth = 1) +
+  geom_point(data = magpie_lines,
+             aes(x = factor(year), y = value_kt, shape = scenario, color = scenario),
+             size = 2.4) +
+  scale_color_manual(
+    values = c(
+      "Cenário sem precificação" = "#FF0000",
+      "Cenário com precificação de emissões e políticas atuais" = "#053D7F",
+      "Cenário com precificação de emissões e política de mitigação moderada" = "#008E40"
+    )
+  ) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Figura 5. Emissões de Metano (CH4): Inventário do SIRENE (barras) e Simulações do Modelo MAgPIE (linhas)",
+    x = NULL, y = "Emissões de CH4 (kt CO2e)",
+    linetype = NULL, shape = NULL, color = NULL
+  ) +
+ theme_minimal(base_size = 12) +
+  theme(legend.position = "top",
+  plot.title = element_text(size = 14))
+```
+
+O conjunto de mapas apresenta a variação espacial das emissões de metano $(CH_4)$, em termos de $Δ kt CO_2e$, no Brasil ao longo do período de 2010 a 2100, em um cenário de precificação de emissões com mitigação moderada. A escala de cores indica reduções de emissões (valores negativos), sendo que tons mais claros representam quedas mais intensas. O padrão espacial sugere que os efeitos da política se tornam progressivamente mais relevantes no longo prazo, promovendo reduções mais acentuadas nas regiões com maior concentração de emissões agropecuárias.
+
+```{r, warning = FALSE, message = FALSE}
+# Diferença (pkbudg1000 - npi)
+df_diff <- df_pkbudg1000_ch4 |>
+  left_join(df_npi_ch4, by = c("lon","lat","iso","year.end")) |>
+  mutate(value = kt_pkbudg1000_ch4 - kt_npi_ch4) |>
+  dplyr::select(lon, lat, year.end, value) |>
+  filter(is.finite(lon), is.finite(lat), is.finite(value))
+
+# Rasteriza por ano e plota
+g_diff <- gridify_by_year(df_diff, bra_sf = bra)
+p_diff <- plot_faceted_map(g_diff, bra, biomes,
+                           title = "Figura 6. Variação nas emissões de metano (CH4) em um cenário de precificação de emissões e de mitigação moderada",
+                           fill_lab = "Δ kt CO2e",
+                           pal = pal_magpie_ch4)+
+  scale_x_continuous(
+    breaks = seq(-75, -30, by = 10),
+    labels = function(x) paste0(abs(x), "°W")) +
+  scale_y_continuous(
+    breaks = seq(-35, 10, by = 10),
+    labels = function(y) {
+      ifelse(y < 0,
+             paste0(abs(y), "°S"),
+             paste0(y, "°N"))})+
+  theme_minimal(base_size = 11) +
+  theme(
+    # Título
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    # Facetas (anos)
+    strip.text = element_text(size = 10,face = "bold"),
+    # Legenda
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text  = element_text(size = 9),
+    legend.key.width = unit(1.5, "cm"),
+    # Margens mais compactas
+    plot.margin = margin(10, 10, 10, 10))
+
+p_diff
+```
+
+
+A Figura 7 apresenta as trajetórias de emissões de óxido nitroso $(N_2O)$ nos diferentes cenários considerados. A direção dos impactos simulados para as emissões de $N_2O$ é semelhante à observada no caso do $CH_4$: os cenários sem precificação e com políticas atuais apresentam trajetórias muito próximas, enquanto o cenário com mitigação moderada mostra reduções mais expressivas no longo prazo. Contudo, as magnitudes e o perfil temporal diferem do metano, refletindo especificidades das fontes de $N_2O$ e sua menor sensibilidade inicial a políticas de escopo limitado.
+
+
+```{r dados2, warning = FALSE, message = FALSE}
+
+##Impacto sobre as emissões de n2o
+
+# Pastas dos cenários
+scen_npi_n2o <- "default"
+scen_none_n2o <- "v2_None_2026-02-10_01.42.20"
+scen_pkbudg1000_n2o   <- "v2_reddnatveg_nosoil_2026-02-10_02"
+
+# Pastagem como weight
+x <- read.magpie(file.path(scen_pkbudg1000_ch4, "cell.land_0.5.mz"))[,, "past"]
+x[is.na(x)] <- 0
+
+gas    <- "n2o"
+years  <- c(2010, 2015, 2020, 2025, 2030, 2035, 2040, 2045, 2050, 2100)
+yearS  <- fmt_year(years)
+
+# Função local: extrai total por célula/ano (kt CO2e) para um cenário
+get_cell_total <- function(scen_dir) {
+
+  # 1) Emissões por gás no nível regional (reg), em Mt gás
+  emis_gas2 <- Emissions(
+    gdx        = file.path(scen_dir, "fulldata.gdx"),
+    type       = gas,
+    level      = "reg",
+    unit       = "GWP100AR5",
+    cumulative = FALSE
+  )
+  emis_gas2 <- emis_gas2[, paste0("y", years)]
+
+  # 2) Agrega de região -> célula usando mapa/weight
+  dis_emis_gas2 <- madrat::toolAggregate(emis_gas2, map_file, x, from = "region", to = "cell")
+
+  # 3) Para todos os 'pollutants' do gás, extrai BRA x anos e empilha
+  ks2 <- magclass::getItems(dis_emis_gas2, dim = 3)
+  ks2 <- grep(paste0("\\.", gas, "$"), ks2, value = TRUE)
+
+  df_gas_total2 <- dplyr::bind_rows(lapply(ks2, function(k) mag_to_df(dis_emis_gas2["BRA", yearS, k])))
+
+  # 4) Soma sobre as fontes para dar o total por célula/ano (Mt CO2e)
+  df_gas_sum2 <- aggregate(value ~ lon + lat + iso + year.start + year.end,
+                          data = df_gas_total2, FUN = sum)
+
+  # 5) Junta com grades BRA e converte Mt -> kt
+  BRA |>
+    left_join(df_gas_sum2, by = c("lon","lat","iso")) |>
+    mutate(value = dplyr::coalesce(value, 0),
+           kt_co2eq = mt_to_kt(value)) |>
+    dplyr::select(lon, lat, iso, year.end, kt_co2eq)
+}
+
+# Extrai none, npi e pkbudg1000
+df_none_n2o   <- get_cell_total(scen_none_n2o)   |> dplyr::rename(kt_none_n2o   = kt_co2eq)
+df_npi_n2o    <- get_cell_total(scen_npi_n2o)    |> dplyr::rename(kt_npi_n2o   = kt_co2eq)
+df_pkbudg1000_n2o <- get_cell_total(scen_pkbudg1000_n2o) |> dplyr::rename(kt_pkbudg1000_n2o = kt_co2eq)
+
+# ---- Totais MAgPIE (none / npi / pkbudg1000) por ano ----
+tot_none_n2o <- df_none_n2o |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_none_n2o, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "Cenário sem precificação")
+
+tot_npi_n2o <- df_npi_n2o |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_npi_n2o, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "Cenário com precificação de emissões e políticas atuais")
+
+tot_pkbudg1000_n2o <- df_pkbudg1000_n2o |>
+  dplyr::mutate(year = as.integer(gsub("[^0-9]", "", year.end))) |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(value_kt = sum(kt_pkbudg1000_n2o, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(scenario = "Cenário com precificação de emissões e política de mitigação moderada")
+
+magpie_lines <- dplyr::bind_rows(tot_none_n2o, tot_npi_n2o, tot_pkbudg1000_n2o) |>
+  dplyr::filter(year %in% years) |>
+  dplyr::mutate(
+    scenario = factor(
+      scenario, levels = c("Cenário sem precificação",
+                           "Cenário com precificação de emissões e políticas atuais",
+                           "Cenário com precificação de emissões e política de mitigação moderada")))
+
+# ---- SIRENE (barras; só 2010/2015/2020) ----
+sirene_br_n2o <- tibble::tibble(
+  year = c(2010, 2015, 2020),
+  value_kt = c(130140,  140231,  156306)
+)
+
+# ---- Plot: barras (SIRENE) + linhas (MAgPIE) ----
+ggplot() +
+  geom_col(data = sirene_br_n2o,
+           aes(x = factor(year), y = value_kt),
+           width = 0.7, alpha = 0.6) +
+  geom_text(data = sirene_br_n2o,
+            aes(x = factor(year), y = value_kt, label = scales::comma(value_kt)),
+            vjust = -0.2, size = 3.3) +
+  geom_line(data = magpie_lines,
+            aes(x = factor(year), y = value_kt, group = scenario, linetype = scenario, color = scenario),
+            linewidth = 1) +
+  geom_point(data = magpie_lines,
+             aes(x = factor(year), y = value_kt, shape = scenario, color = scenario),
+             size = 2.4) +
+  scale_color_manual(
+    values = c(
+      "Cenário sem precificação" = "#981002",
+      "Cenário com precificação de emissões e políticas atuais" = "#F414CF",
+      "Cenário com precificação de emissões e política de mitigação moderada" = "#106E26"
+    )
+  ) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Figura 7. Emissões de óxido nitroso (N2O): Inventário do SIRENE (barras) e Simulações do Modelo MAgPIE (linhas)",
+    x = NULL, y = "Emissões de N2O (kt CO2e)",
+    linetype = NULL, shape = NULL, color = NULL
+  ) +
+ theme_minimal(base_size = 12) +
+  theme(legend.position = "top",
+  plot.title = element_text(size = 14))
+
+```
+
+O conjunto de mapas à seguir (Figura 8) mostra a variação espacial das emissões de óxido nitroso $(N_2O)$, em termos de $Δ kt CO₂e$, no Brasil ao longo do período de 2010 a 2100, em um cenário de precificação de emissões com mitigação moderada. A escala de cores indica reduções de emissões (valores negativos), sendo que tons mais claros representam quedas mais intensas. O padrão espacial sugere que os efeitos da política se tornam relativamente maiores no longo prazo.
+
+```{r}
+# Diferença n2o (pkbudg1000 - npi)
+df_diff2 <- df_pkbudg1000_n2o |>
+  left_join(df_npi_n2o, by = c("lon","lat","iso","year.end")) |>
+  mutate(value = kt_pkbudg1000_n2o - kt_npi_n2o) |>
+  dplyr::select(lon, lat, year.end, value) |>
+  filter(is.finite(lon), is.finite(lat), is.finite(value))
+
+# Rasteriza por ano e plota
+g_diff2 <- gridify_by_year(df_diff2, bra_sf = bra)
+p_diff2 <- plot_faceted_map(g_diff2, bra, biomes,
+                           title = "Figura 8. Variação nas emissões de óxido nitroso (N2O) em um cenário de precificação de emissões e de mitigação moderada",
+                           fill_lab = "Δ kt CO2e",
+                           pal = pal_magpie_n2o)+
+  scale_x_continuous(
+    breaks = seq(-75, -30, by = 10),
+    labels = function(x) paste0(abs(x), "°W")) +
+  scale_y_continuous(
+    breaks = seq(-35, 10, by = 10),
+    labels = function(y) {
+      ifelse(y < 0,
+             paste0(abs(y), "°S"),
+             paste0(y, "°N"))})+
+  theme_minimal(base_size = 11) +
+  theme(
+    # Título
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    # Facetas (anos)
+    strip.text = element_text(size = 10,face = "bold"),
+    # Legenda
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text  = element_text(size = 9),
+    legend.key.width = unit(1.5, "cm"),
+    # Margens mais compactas
+    plot.margin = margin(10, 10, 10, 10))
+
+p_diff2
+```
